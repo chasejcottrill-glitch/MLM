@@ -1,14 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from 'react';
 import { artworkUrl, type PlaybackSnapshot } from '../lib/musickit';
 
-type Mode = 'music' | 'microphone';
+type Mode = 'music' | 'system' | 'microphone';
 
 export default function Visualizer({ playback }: { playback: PlaybackSnapshot }) {
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const analyserRef = useRef<AnalyserNode | null>(null);
   const streamRef = useRef<MediaStream | null>(null);
+  const audioContextRef = useRef<AudioContext | null>(null);
   const [mode, setMode] = useState<Mode>('music');
-  const [micError, setMicError] = useState('');
+  const [captureError, setCaptureError] = useState('');
 
   const seed = useMemo(() => {
     const text = `${playback.item?.attributes?.name || ''}:${playback.item?.attributes?.artistName || ''}`;
@@ -16,29 +17,64 @@ export default function Visualizer({ playback }: { playback: PlaybackSnapshot })
   }, [playback.item]);
 
   useEffect(() => {
-    if (mode !== 'microphone') {
+    const stopCapture = () => {
       streamRef.current?.getTracks().forEach(track => track.stop());
       streamRef.current = null;
       analyserRef.current = null;
+      void audioContextRef.current?.close().catch(() => undefined);
+      audioContextRef.current = null;
+    };
+
+    if (mode === 'music') {
+      stopCapture();
+      setCaptureError('');
       return;
     }
+
     let cancelled = false;
-    navigator.mediaDevices.getUserMedia({ audio: true }).then(stream => {
-      if (cancelled) return stream.getTracks().forEach(track => track.stop());
-      const context = new AudioContext();
-      const source = context.createMediaStreamSource(stream);
-      const analyser = context.createAnalyser();
-      analyser.fftSize = 256;
-      source.connect(analyser);
-      streamRef.current = stream;
-      analyserRef.current = analyser;
-      setMicError('');
-    }).catch(error => setMicError(error instanceof Error ? error.message : 'Microphone unavailable'));
+
+    const start = async () => {
+      try {
+        const stream = mode === 'system'
+          ? await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
+          : await navigator.mediaDevices.getUserMedia({ audio: true });
+
+        if (cancelled) {
+          stream.getTracks().forEach(track => track.stop());
+          return;
+        }
+
+        if (mode === 'system') {
+          // Electron's Windows desktop shell supplies loopback audio. The video track is
+          // required to establish display capture but is not used by the visualizer.
+          stream.getVideoTracks().forEach(track => track.stop());
+          if (!stream.getAudioTracks().length) {
+            stream.getTracks().forEach(track => track.stop());
+            throw new Error('No system-audio track was provided. Use the Windows desktop build for automatic loopback capture.');
+          }
+        }
+
+        const context = new AudioContext();
+        await context.resume();
+        const source = context.createMediaStreamSource(stream);
+        const analyser = context.createAnalyser();
+        analyser.fftSize = 512;
+        analyser.smoothingTimeConstant = 0.82;
+        source.connect(analyser);
+
+        streamRef.current = stream;
+        audioContextRef.current = context;
+        analyserRef.current = analyser;
+        setCaptureError('');
+      } catch (error) {
+        setCaptureError(error instanceof Error ? error.message : 'Audio capture unavailable');
+      }
+    };
+
+    void start();
     return () => {
       cancelled = true;
-      streamRef.current?.getTracks().forEach(track => track.stop());
-      streamRef.current = null;
-      analyserRef.current = null;
+      stopCapture();
     };
   }, [mode]);
 
@@ -49,7 +85,7 @@ export default function Visualizer({ playback }: { playback: PlaybackSnapshot })
     if (!ctx) return;
     let frame = 0;
     let raf = 0;
-    const bins = new Uint8Array(128);
+    const bins = new Uint8Array(256);
 
     const render = () => {
       const rect = canvas.getBoundingClientRect();
@@ -61,8 +97,9 @@ export default function Visualizer({ playback }: { playback: PlaybackSnapshot })
         canvas.height = h;
       }
       ctx.clearRect(0, 0, w, h);
+
       let energy = playback.state ? 0.58 : 0.22;
-      if (mode === 'microphone' && analyserRef.current) {
+      if (mode !== 'music' && analyserRef.current) {
         analyserRef.current.getByteFrequencyData(bins);
         energy = bins.reduce((a, b) => a + b, 0) / bins.length / 255;
       } else if (playback.currentTime) {
@@ -86,6 +123,7 @@ export default function Visualizer({ playback }: { playback: PlaybackSnapshot })
       frame += 1;
       raf = requestAnimationFrame(render);
     };
+
     render();
     return () => cancelAnimationFrame(raf);
   }, [mode, playback.currentTime, playback.state, seed]);
@@ -97,13 +135,14 @@ export default function Visualizer({ playback }: { playback: PlaybackSnapshot })
       <div className="visualizer-overlay">
         <div className="mode-switch" role="group" aria-label="Visualizer mode">
           <button className={mode === 'music' ? 'active' : ''} onClick={() => setMode('music')}>Apple Music</button>
+          <button className={mode === 'system' ? 'active' : ''} onClick={() => setMode('system')}>System Audio</button>
           <button className={mode === 'microphone' ? 'active' : ''} onClick={() => setMode('microphone')}>Microphone</button>
         </div>
         <div className="now-playing">
           <strong>{playback.item?.attributes?.name || 'Nothing playing'}</strong>
-          <span>{playback.item?.attributes?.artistName || 'Start a track in this player'}</span>
+          <span>{playback.item?.attributes?.artistName || (mode === 'system' ? 'Windows loopback visualizer' : 'Start a track in this player')}</span>
         </div>
-        {micError && <div className="status error">{micError}</div>}
+        {captureError && <div className="status error">{captureError}</div>}
       </div>
     </section>
   );
