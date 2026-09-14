@@ -1,0 +1,44 @@
+name: Build Windows Desktop
+
+on:
+  workflow_dispatch:
+  push:
+    branches: [main]
+    paths:
+      - 'desktop/**'
+      - '.github/workflows/windows-desktop.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  build-windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        working-directory: desktop
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm'
+          cache-dependency-path: desktop/package.json
+
+      - name: Install desktop dependencies
+        run: npm install
+
+      - name: Build Windows installer and portable executable
+        run: npm run package
+
+      - name: Upload Windows builds
+        uses: actions/upload-artifact@v4
+        with:
+          name: genre-organizer-visualizer-windows
+          path: |
+            desktop/dist/*.exe
+          if-no-files-found: error
