@@ -4,6 +4,7 @@ import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { importPKCS8, SignJWT } from 'jose';
 import { MusicKit as NodeMusicKit } from 'node-musickit-api';
+import { analyzeWithGenreGuru, genreGuruConfigured, genreGuruEvidencePower } from './genreGuru.js';
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -59,7 +60,12 @@ async function getNodeMusicKit() {
 }
 
 app.get('/api/health', (_req, res) => {
-  res.json({ ok: true, musicKitConfigured: Boolean(credentials()) });
+  res.json({
+    ok: true,
+    musicKitConfigured: Boolean(credentials()),
+    genreGuruConfigured: genreGuruConfigured(),
+    genreGuruMode: 'selective-apple-preview-adjudication'
+  });
 });
 
 app.get('/api/musickit/developer-token', async (_req, res) => {
@@ -89,6 +95,77 @@ app.get('/api/musickit/catalog/search', async (req, res) => {
     res.status(result.status || 200).json(result.data ?? { error: result.error });
   } catch (error) {
     res.status(503).json({ error: error instanceof Error ? error.message : 'Catalog search unavailable' });
+  }
+});
+
+app.post('/api/genre-guru/analyze-catalog', async (req, res) => {
+  try {
+    if (!genreGuruConfigured()) {
+      return res.status(503).json({ error: 'Genre Guru is not configured', setupRequired: true });
+    }
+
+    const storefront = String(req.body?.storefront || 'us').trim().toLowerCase();
+    const catalogId = String(req.body?.catalogId || '').trim();
+    const profile = req.body?.profile ? String(req.body.profile).trim() : undefined;
+    if (!catalogId) return res.status(400).json({ error: 'catalogId is required' });
+
+    const kit = await getNodeMusicKit();
+    const songResponse = await kit.songs.get(storefront, catalogId, true);
+    if (!songResponse.data) {
+      return res.status(songResponse.status || 404).json({ error: songResponse.error || 'Apple catalog song not found' });
+    }
+
+    const raw: any = songResponse.data;
+    const song = Array.isArray(raw?.data) ? raw.data[0] : raw?.data?.[0] ?? raw;
+    const attributes = song?.attributes || {};
+    const previewUrl = attributes?.previews?.[0]?.url || attributes?.previews?.[0]?.hlsUrl;
+    if (!previewUrl) {
+      return res.status(422).json({ error: 'No Apple Music preview is available for this catalog song' });
+    }
+
+    const previewResponse = await fetch(previewUrl, { signal: AbortSignal.timeout(30_000) });
+    if (!previewResponse.ok) {
+      return res.status(502).json({ error: `Apple preview fetch failed with ${previewResponse.status}` });
+    }
+
+    const declaredBytes = Number(previewResponse.headers.get('content-length') || 0);
+    if (declaredBytes > 20 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Preview asset is larger than the 20 MB analysis limit' });
+    }
+
+    const audio = await previewResponse.arrayBuffer();
+    if (audio.byteLength > 20 * 1024 * 1024) {
+      return res.status(413).json({ error: 'Preview asset is larger than the 20 MB analysis limit' });
+    }
+
+    const analysis: any = await analyzeWithGenreGuru({
+      cacheKey: `${storefront}:${catalogId}:${profile || 'auto'}`,
+      audio,
+      filename: `${catalogId}.m4a`,
+      mimeType: previewResponse.headers.get('content-type') || 'audio/mp4',
+      profile
+    });
+
+    const primary = analysis?.result?.primary_genre;
+    const rawConfidence = Number(primary?.confidence) || 0;
+
+    res.json({
+      source: 'Genre Guru',
+      evidenceType: 'acoustic-analysis-of-apple-preview',
+      catalogId,
+      isrc: attributes?.isrc || null,
+      profile: profile || 'auto',
+      primaryGenre: primary || null,
+      secondaryGenres: analysis?.result?.secondary_genres || [],
+      evidencePower: genreGuruEvidencePower(rawConfidence),
+      rawModelConfidence: rawConfidence,
+      cached: Boolean(analysis?.cached),
+      result: analysis?.result || null
+    });
+  } catch (error) {
+    const message = error instanceof Error ? error.message : 'Genre Guru analysis failed';
+    const status = message.includes('aborted') || message.includes('timeout') ? 504 : 502;
+    res.status(status).json({ error: message });
   }
 });
 
