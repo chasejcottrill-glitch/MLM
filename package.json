@@ -6,9 +6,9 @@
   "engines": { "node": ">=20" },
   "scripts": {
     "dev": "concurrently \"vite --host 0.0.0.0\" \"tsx watch server/index.ts\"",
-    "build": "tsc -b && vite build",
+    "build": "vite build",
     "start": "tsx server/index.ts",
-    "typecheck": "tsc -b --pretty false"
+    "typecheck": "tsc --noEmit --pretty false"
   },
   "dependencies": {
     "@vitejs/plugin-react": "latest",
