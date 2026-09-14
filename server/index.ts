@@ -17,6 +17,11 @@ import {
   SOURCE_RELIABILITY,
   type GenreEvidence
 } from './genreEvidence.js';
+import {
+  collectGenreEvidenceParallel,
+  getSourceAvailability,
+  type TrackIdentity
+} from './genreSources.js';
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -72,12 +77,18 @@ async function getNodeMusicKit() {
 }
 
 app.get('/api/health', (_req, res) => {
+  const sources = getSourceAvailability();
   res.json({
     ok: true,
     musicKitConfigured: Boolean(credentials()),
     genreGuruConfigured: genreGuruConfigured(),
     genreGuruMode: 'selective-apple-preview-adjudication',
-    genreGuruStrategy: 'profile-guided-when-known; auto-two-pass-fallback; ISRC-cache; in-flight-deduplication'
+    genreGuruStrategy: 'profile-guided-when-known; auto-two-pass-fallback; ISRC-cache; in-flight-deduplication',
+    sources: sources.map(src => ({
+      source: src.source,
+      configured: src.configured,
+      automation: src.automation
+    }))
   });
 });
 
@@ -101,6 +112,68 @@ app.post('/api/genre/score', (req, res) => {
   if (evidence.length > 100) return res.status(413).json({ error: 'At most 100 evidence items are allowed per score request' });
 
   res.json(combineGenreEvidence(evidence));
+});
+
+app.post('/api/genre/research', async (req, res) => {
+  try {
+    // Validate input: require either mbid/isrc or title+artist
+    const mbid = req.body?.mbid ? String(req.body.mbid).trim() : undefined;
+    const isrc = req.body?.isrc ? String(req.body.isrc).trim() : undefined;
+    const title = req.body?.title ? String(req.body.title).trim() : undefined;
+    const artist = req.body?.artist ? String(req.body.artist).trim() : undefined;
+    const album = req.body?.album ? String(req.body.album).trim() : undefined;
+    const appleGenres = Array.isArray(req.body?.appleGenres) ? req.body.appleGenres.filter(Boolean) : undefined;
+    const allMusicGenres = Array.isArray(req.body?.allMusicGenres) ? req.body.allMusicGenres.filter(Boolean) : undefined;
+
+    if (!mbid && !isrc && (!title || !artist)) {
+      return res.status(400).json({
+        error: 'Either mbid/isrc or both title and artist are required'
+      });
+    }
+
+    const identity: TrackIdentity = {
+      title: title || '',
+      artist: artist || '',
+      ...(album ? { album } : {}),
+      ...(isrc ? { isrc } : {}),
+      ...(mbid ? { mbid } : {}),
+      ...(appleGenres?.length ? { appleGenres } : {}),
+      ...(allMusicGenres?.length ? { allMusicGenres } : {})
+    };
+
+    // Collect evidence: resolve MusicBrainz first, then parallel lookups
+    const sourceResults = await collectGenreEvidenceParallel(identity);
+
+    // Flatten all evidence
+    const flattenedEvidence = sourceResults.flatMap(sr => sr.evidence);
+
+    // Combine evidence and get final genre/confidence
+    const combined = combineGenreEvidence(flattenedEvidence);
+
+    res.json({
+      query: identity,
+      sourceResults: sourceResults.map(sr => ({
+        source: sr.source,
+        configured: sr.configured,
+        evidence: sr.evidence,
+        matched: sr.matched || undefined,
+        error: sr.error || undefined
+      })),
+      flattenedEvidence,
+      result: {
+        genre: combined.genre,
+        confidence: combined.confidence,
+        interval90: combined.interval90,
+        sourceCount: combined.sourceCount,
+        status: combined.status,
+        ranked: combined.ranked
+      }
+    });
+  } catch (error) {
+    res.status(500).json({
+      error: error instanceof Error ? error.message : 'Genre research failed'
+    });
+  }
 });
 
 app.get('/api/musickit/developer-token', async (_req, res) => {
@@ -224,3 +297,4 @@ app.use((req, res, next) => {
 app.listen(port, '0.0.0.0', () => {
   console.log(`Genre Organizer + Visualizer listening on :${port}`);
 });
+

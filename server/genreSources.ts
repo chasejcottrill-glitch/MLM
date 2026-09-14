@@ -18,6 +18,12 @@ export type SourceResult = {
   error?: string;
 };
 
+export type SourceAvailability = {
+  source: string;
+  configured: boolean;
+  automation: 'direct' | 'optional-key' | 'manual-or-licensed';
+};
+
 type CacheEntry<T> = { expiresAt: number; value: T };
 const sourceCache = new Map<string, CacheEntry<SourceResult>>();
 const CACHE_TTL_MS = 1000 * 60 * 60 * 24 * 7;
@@ -227,7 +233,8 @@ export async function wikidataEvidence(identity: TrackIdentity): Promise<SourceR
     const url = `https://query.wikidata.org/sparql?format=json&query=${encodeURIComponent(query)}`;
     const data = await fetchJson(url, {}, 15_000);
     const bindings = Array.isArray(data?.results?.bindings) ? data.results.bindings : [];
-    const labels = [...new Set(bindings.map((row: any) => String(row?.genreLabel?.value || '').trim()).filter(Boolean))];
+    const labelSet = new Set(bindings.map((row: any) => String(row?.genreLabel?.value || '').trim()).filter(Boolean));
+    const labels: string[] = Array.from(labelSet) as string[];
     const evidence: GenreEvidence[] = labels.map(label => ({
       source: 'wikidata', genre: label, level: 'recording', matchConfidence: 1, tagConfidence: 0.86
     }));
@@ -282,14 +289,82 @@ export function callerEvidence(identity: TrackIdentity): SourceResult[] {
   return results;
 }
 
-export async function collectGenreEvidence(identity: TrackIdentity) {
-  const sourceResults = await Promise.all([
-    musicBrainzEvidence(identity),
-    discogsEvidence(identity),
-    lastFmEvidence(identity),
-    audioDbEvidence(identity),
-    wikidataEvidence(identity)
+export async function collectGenreEvidenceParallel(identity: TrackIdentity) {
+  // Step 1: Resolve canonical identity via MusicBrainz first (MBID/ISRC exact match)
+  // This is required before we do downstream lookups, to ensure we're looking up the right recording
+  let resolvedMbid = identity.mbid;
+  let mbResolved: SourceResult | null = null;
+
+  if (!resolvedMbid && (identity.isrc || (identity.title && identity.artist))) {
+    // Must resolve MusicBrainz to get canonical MBID before parallel lookups
+    mbResolved = await musicBrainzEvidence(identity);
+    if (mbResolved.matched?.mbid) {
+      resolvedMbid = String(mbResolved.matched.mbid);
+    }
+  }
+
+  // Step 2: Create updated identity with resolved MBID for downstream lookups
+  const enrichedIdentity: TrackIdentity = {
+    ...identity,
+    ...(resolvedMbid ? { mbid: resolvedMbid } : {})
+  };
+
+  // Step 3: Parallel lookups to Wikidata, TheAudioDB, Last.fm (Discogs remains optional-token)
+  const sourceResults: SourceResult[] = [];
+
+  // Add MusicBrainz result if we already have it, otherwise fetch it now
+  if (mbResolved) {
+    sourceResults.push(mbResolved);
+  } else {
+    sourceResults.push(await musicBrainzEvidence(enrichedIdentity));
+  }
+
+  // Parallel: Wikidata, TheAudioDB, Last.fm, Discogs
+  const [wikidata, audioDb, lastFm, discogs] = await Promise.all([
+    wikidataEvidence(enrichedIdentity),
+    audioDbEvidence(enrichedIdentity),
+    lastFmEvidence(enrichedIdentity),
+    discogsEvidence(enrichedIdentity)
   ]);
-  sourceResults.push(...callerEvidence(identity));
+
+  sourceResults.push(wikidata, audioDb, lastFm, discogs);
+  sourceResults.push(...callerEvidence(enrichedIdentity));
+
   return sourceResults;
 }
+
+export function getSourceAvailability(): SourceAvailability[] {
+  return [
+    {
+      source: 'musicbrainz',
+      configured: true,
+      automation: 'direct'
+    },
+    {
+      source: 'wikidata',
+      configured: true,
+      automation: 'direct'
+    },
+    {
+      source: 'theaudiodb',
+      configured: true,
+      automation: 'direct'
+    },
+    {
+      source: 'lastfm',
+      configured: Boolean(process.env.LASTFM_API_KEY?.trim()),
+      automation: 'optional-key'
+    },
+    {
+      source: 'discogs',
+      configured: Boolean(process.env.DISCOGS_TOKEN?.trim()),
+      automation: 'optional-key'
+    },
+    {
+      source: 'allmusic',
+      configured: false,
+      automation: 'manual-or-licensed'
+    }
+  ];
+}
+
