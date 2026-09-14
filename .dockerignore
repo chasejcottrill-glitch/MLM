@@ -1,0 +1,11 @@
+# Railway/Railpack production image only needs the hosted web/backend app.
+# Keep the Windows Electron shell in GitHub, but do not include it in Linux builds.
+desktop/
+
+# Local/build artifacts and metadata
+**/node_modules
+.git
+.github
+*.log
+.env
+.env.*
