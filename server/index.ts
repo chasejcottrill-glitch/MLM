@@ -11,6 +11,12 @@ import {
   genreGuruEvidencePower,
   getCachedGenreGuruAnalysis
 } from './genreGuru.js';
+import {
+  combineGenreEvidence,
+  LEVEL_POWER,
+  SOURCE_RELIABILITY,
+  type GenreEvidence
+} from './genreEvidence.js';
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -73,6 +79,28 @@ app.get('/api/health', (_req, res) => {
     genreGuruMode: 'selective-apple-preview-adjudication',
     genreGuruStrategy: 'profile-guided-when-known; auto-two-pass-fallback; ISRC-cache; in-flight-deduplication'
   });
+});
+
+app.get('/api/genre/reliability', (_req, res) => {
+  res.json({
+    model: 'evidence-power-v1',
+    warning: 'Power coefficients are provenance/granularity weights, not published database accuracy percentages.',
+    sources: SOURCE_RELIABILITY,
+    levels: LEVEL_POWER,
+    thresholds: {
+      autoAssign: 'confidence >= 0.84 and at least 2 independent sources',
+      review: 'confidence >= 0.62',
+      unclassified: 'below review threshold'
+    }
+  });
+});
+
+app.post('/api/genre/score', (req, res) => {
+  const evidence = Array.isArray(req.body?.evidence) ? req.body.evidence as GenreEvidence[] : null;
+  if (!evidence) return res.status(400).json({ error: 'evidence array is required' });
+  if (evidence.length > 100) return res.status(413).json({ error: 'At most 100 evidence items are allowed per score request' });
+
+  res.json(combineGenreEvidence(evidence));
 });
 
 app.get('/api/musickit/developer-token', async (_req, res) => {
