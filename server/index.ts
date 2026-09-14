@@ -22,6 +22,12 @@ import {
   getSourceAvailability,
   type TrackIdentity
 } from './genreSources.js';
+import {
+  applePublicGenreEvidence,
+  discogsPublicEvidence,
+  iTunesCatalogLookup,
+  iTunesCatalogSearch
+} from './noKeySources.js';
 
 const app = express();
 const port = Number(process.env.PORT || 3000);
@@ -84,6 +90,7 @@ app.get('/api/health', (_req, res) => {
     genreGuruConfigured: genreGuruConfigured(),
     genreGuruMode: 'selective-apple-preview-adjudication',
     genreGuruStrategy: 'profile-guided-when-known; auto-two-pass-fallback; ISRC-cache; in-flight-deduplication',
+    credentialFreeFallbacks: ['itunes-search-catalog', 'musicbrainz-linked-discogs-public-release'],
     sources: sources.map(src => ({
       source: src.source,
       configured: src.configured,
@@ -116,7 +123,6 @@ app.post('/api/genre/score', (req, res) => {
 
 app.post('/api/genre/research', async (req, res) => {
   try {
-    // Validate input: require either mbid/isrc or title+artist
     const mbid = req.body?.mbid ? String(req.body.mbid).trim() : undefined;
     const isrc = req.body?.isrc ? String(req.body.isrc).trim() : undefined;
     const title = req.body?.title ? String(req.body.title).trim() : undefined;
@@ -141,17 +147,34 @@ app.post('/api/genre/research', async (req, res) => {
       ...(allMusicGenres?.length ? { allMusicGenres } : {})
     };
 
-    // Collect evidence: resolve MusicBrainz first, then parallel lookups
-    const sourceResults = await collectGenreEvidenceParallel(identity);
+    let sourceResults = await collectGenreEvidenceParallel(identity);
+    const mbResult = sourceResults.find(sr => sr.source === 'musicbrainz');
+    const resolvedMbid = identity.mbid || (mbResult?.matched?.mbid ? String(mbResult.matched.mbid) : undefined);
+    const enrichedIdentity: TrackIdentity = {
+      ...identity,
+      ...(resolvedMbid ? { mbid: resolvedMbid } : {})
+    };
 
-    // Flatten all evidence
+    const hasAppleEvidence = sourceResults.some(sr => sr.source === 'apple-music' && sr.evidence.length > 0);
+    if (!hasAppleEvidence && enrichedIdentity.title && enrichedIdentity.artist) {
+      sourceResults.push(await applePublicGenreEvidence(enrichedIdentity));
+    }
+
+    const discogsIndex = sourceResults.findIndex(sr => sr.source === 'discogs');
+    const discogsResult = discogsIndex >= 0 ? sourceResults[discogsIndex] : null;
+    if ((!discogsResult?.configured || !discogsResult.evidence.length) && enrichedIdentity.mbid) {
+      const publicDiscogs = await discogsPublicEvidence(enrichedIdentity);
+      if (publicDiscogs.evidence.length || !discogsResult) {
+        if (discogsIndex >= 0) sourceResults[discogsIndex] = publicDiscogs;
+        else sourceResults.push(publicDiscogs);
+      }
+    }
+
     const flattenedEvidence = sourceResults.flatMap(sr => sr.evidence);
-
-    // Combine evidence and get final genre/confidence
     const combined = combineGenreEvidence(flattenedEvidence);
 
     res.json({
-      query: identity,
+      query: enrichedIdentity,
       sourceResults: sourceResults.map(sr => ({
         source: sr.source,
         configured: sr.configured,
@@ -190,10 +213,24 @@ app.get('/api/musickit/developer-token', async (_req, res) => {
 });
 
 app.get('/api/musickit/catalog/search', async (req, res) => {
+  const term = String(req.query.q || '').trim();
+  const storefront = String(req.query.storefront || 'us').trim();
+  if (!term) return res.status(400).json({ error: 'Missing q parameter' });
+
+  if (!credentials()) {
+    try {
+      const results = await iTunesCatalogSearch(term, storefront, 10);
+      return res.json({
+        source: 'itunes-search-public-fallback',
+        fallback: true,
+        results
+      });
+    } catch (error) {
+      return res.status(503).json({ error: error instanceof Error ? error.message : 'Public Apple catalog search unavailable' });
+    }
+  }
+
   try {
-    const term = String(req.query.q || '').trim();
-    const storefront = String(req.query.storefront || 'us').trim();
-    if (!term) return res.status(400).json({ error: 'Missing q parameter' });
     const kit = await getNodeMusicKit();
     const result = await kit.search(storefront, {
       term,
@@ -202,7 +239,12 @@ app.get('/api/musickit/catalog/search', async (req, res) => {
     });
     res.status(result.status || 200).json(result.data ?? { error: result.error });
   } catch (error) {
-    res.status(503).json({ error: error instanceof Error ? error.message : 'Catalog search unavailable' });
+    try {
+      const results = await iTunesCatalogSearch(term, storefront, 10);
+      res.json({ source: 'itunes-search-public-fallback', fallback: true, results });
+    } catch {
+      res.status(503).json({ error: error instanceof Error ? error.message : 'Catalog search unavailable' });
+    }
   }
 });
 
@@ -217,15 +259,29 @@ app.post('/api/genre-guru/analyze-catalog', async (req, res) => {
     const profile = req.body?.profile ? String(req.body.profile).trim() : undefined;
     if (!catalogId) return res.status(400).json({ error: 'catalogId is required' });
 
-    const kit = await getNodeMusicKit();
-    const songResponse = await kit.songs.get(storefront, catalogId, true);
-    if (!songResponse.data) {
-      return res.status(songResponse.status || 404).json({ error: songResponse.error || 'Apple catalog song not found' });
+    let attributes: any = {};
+    let publicCatalogFallback = false;
+
+    if (credentials()) {
+      const kit = await getNodeMusicKit();
+      const songResponse = await kit.songs.get(storefront, catalogId, true);
+      if (!songResponse.data) {
+        return res.status(songResponse.status || 404).json({ error: songResponse.error || 'Apple catalog song not found' });
+      }
+      const raw: any = songResponse.data;
+      const song = Array.isArray(raw?.data) ? raw.data[0] : raw?.data?.[0] ?? raw;
+      attributes = song?.attributes || {};
+    } else {
+      const publicSong = await iTunesCatalogLookup(catalogId, storefront);
+      if (!publicSong) return res.status(404).json({ error: 'Apple public catalog song not found' });
+      publicCatalogFallback = true;
+      attributes = {
+        isrc: null,
+        genreNames: publicSong.primaryGenreName ? [publicSong.primaryGenreName] : [],
+        previews: publicSong.previewUrl ? [{ url: publicSong.previewUrl }] : []
+      };
     }
 
-    const raw: any = songResponse.data;
-    const song = Array.isArray(raw?.data) ? raw.data[0] : raw?.data?.[0] ?? raw;
-    const attributes = song?.attributes || {};
     const isrc = String(attributes?.isrc || '').trim().toUpperCase() || null;
     const cacheKey = isrc
       ? `isrc:${isrc}:${profile || 'auto'}`
@@ -269,7 +325,7 @@ app.post('/api/genre-guru/analyze-catalog', async (req, res) => {
 
     res.json({
       source: 'Genre Guru',
-      evidenceType: 'acoustic-analysis-of-apple-preview',
+      evidenceType: publicCatalogFallback ? 'acoustic-analysis-of-itunes-preview' : 'acoustic-analysis-of-apple-preview',
       catalogId,
       isrc,
       profile: profile || 'auto',
@@ -279,6 +335,7 @@ app.post('/api/genre-guru/analyze-catalog', async (req, res) => {
       evidencePower: genreGuruEvidencePower(rawConfidence),
       rawModelConfidence: rawConfidence,
       cached: Boolean(analysis?.cached),
+      publicCatalogFallback,
       result: analysis?.result || null
     });
   } catch (error) {
@@ -297,4 +354,3 @@ app.use((req, res, next) => {
 app.listen(port, '0.0.0.0', () => {
   console.log(`Genre Organizer + Visualizer listening on :${port}`);
 });
-
