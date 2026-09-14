@@ -1,6 +1,9 @@
 # Railway/Railpack production image only needs the hosted web/backend app.
-# Keep the Windows Electron shell in GitHub, but do not include it in Linux builds.
-desktop/
+# Railpack detects nested package.json files before applying exclusions, so keep
+# desktop/package.json available for plan resolution while excluding the actual
+# Windows Electron payload from the Linux production image.
+desktop/**
+!desktop/package.json
 
 # Local/build artifacts and metadata
 **/node_modules
