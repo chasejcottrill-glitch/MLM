@@ -65,6 +65,13 @@ export function genreGuruEvidencePower(rawConfidence: unknown) {
   return Math.min(0.82, 0.35 + confidence * 0.52);
 }
 
+export function getCachedGenreGuruAnalysis(cacheKey: string) {
+  pruneCache();
+  const existing = cache.get(cacheKey);
+  if (!existing || existing.expiresAt <= Date.now()) return null;
+  return { ...existing.value, cached: true };
+}
+
 async function runGenreGuru(options: {
   audio: ArrayBuffer;
   filename?: string;
@@ -115,11 +122,8 @@ export async function analyzeWithGenreGuru(options: {
 }) {
   if (!genreGuruConfigured()) throw new Error('Genre Guru is not configured');
 
-  pruneCache();
-  const existing = cache.get(options.cacheKey);
-  if (existing && existing.expiresAt > Date.now()) {
-    return { ...existing.value, cached: true };
-  }
+  const existing = getCachedGenreGuruAnalysis(options.cacheKey);
+  if (existing) return existing;
 
   const duplicate = inFlight.get(options.cacheKey);
   if (duplicate) return duplicate;
