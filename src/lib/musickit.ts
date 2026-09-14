@@ -131,6 +131,18 @@ export async function fetchLibraryPlaylists() {
   return playlists;
 }
 
+export async function fetchPlaylistTracks(playlistId: string, onProgress?: (count: number) => void) {
+  const songs: AppleMusicSong[] = [];
+  let next: string | null = `/v1/me/library/playlists/${encodeURIComponent(playlistId)}/tracks?limit=100&include=catalog`;
+  while (next) {
+    const page: any = await appleFetch(next);
+    songs.push(...(page?.data || []));
+    onProgress?.(songs.length);
+    next = page?.next || null;
+  }
+  return songs;
+}
+
 export async function createPlaylist(name: string, description: string, tracks: Array<{ id: string; type?: string }> = []) {
   const body: any = { attributes: { name, description } };
   if (tracks.length) {
