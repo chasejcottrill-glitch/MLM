@@ -5,7 +5,7 @@
   "main": "main.cjs",
   "scripts": {
     "start": "electron .",
-    "package": "electron-builder --win nsis"
+    "package": "electron-builder --win nsis portable"
   },
   "devDependencies": {
     "electron": "latest",
@@ -20,7 +20,8 @@
     ],
     "win": {
       "target": [
-        "nsis"
+        "nsis",
+        "portable"
       ]
     },
     "nsis": {
